@@ -10,6 +10,10 @@ import hashlib
 import os
 import sys
 import math
+import json
+import tempfile
+import shutil
+import argparse
 
 
 IMAGE_DOS_SIGNATURE = 0x5A4D  # 'MZ'
@@ -148,7 +152,7 @@ class PEAnalyzer:
             vals = struct.unpack_from(fmt, self.data, o)
             self.arch = "PE32+"
             self.optional = self._map_optional(vals)
-            self.optional["image_base"] = vals[9]
+            self.optional["image_base"] = vals[8]
         else:
             raise ValueError("Unknown optional header magic: %s" % hex(magic))
 
@@ -315,23 +319,211 @@ class PEAnalyzer:
 
         return "\n".join(lines)
 
+    def to_dict(self):
+        return {
+            "path": self.path,
+            "size": self.size,
+            "checksums": self.checksums,
+            "dos": self.dos,
+            "file_header": self.file_header,
+            "optional": self.optional,
+            "arch": self.arch,
+            "sections": self.sections,
+            "imports": self.imports,
+        }
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 pe_analyzer.py <file.exe>")
-        return 1
-    path = sys.argv[1]
-    if not os.path.isfile(path):
-        print("Error: %s not found" % path)
+
+def build_sample_pe() -> bytes:
+    """Hand-build a minimal but valid PE32 that PEAnalyzer must fully parse.
+
+    Layout is a single RWX ``.text`` section (raw_offset 0x200 maps to
+    virtual_address 0x1000) containing code, two import descriptors
+    (KERNEL32.ExitProcess, USER32.MessageBoxW), ILT/IAT arrays and
+    hint/name entries. Fully offline and deterministic.
+    """
+    def align(v, a):
+        return (v + a - 1) & ~(a - 1)
+
+    FILE_ALIGN = 0x200
+    SECT_ALIGN = 0x1000
+    VA = 0x1000
+    RAW = 0x200
+
+    def rva(off):
+        return VA + (off - RAW)
+
+    raw = bytearray()
+    code_off = 0
+    cursor = RAW
+
+    def add(blob):
+        nonlocal cursor
+        while cursor % 16:
+            cursor += 1
+            raw.append(0)
+        off = cursor
+        raw.extend(blob)
+        cursor += len(blob)
+        return off
+
+    add(b"\xb8\x01\x00\x00\x00\xc3" + b"\x90" * 8)          # mov eax,1; ret ; nops
+    add(b"Minimal PE32 test image (M7) - do not run\0")
+
+    desc_size = 20
+    null_desc = b"\x00" * desc_size
+    dll_k = b"KERNEL32.dll\0"
+    dll_u = b"USER32.dll\0"
+    hn_exit = b"\x00\x00ExitProcess\0"
+    hn_msg = b"\x00\x00MessageBoxW\0"
+
+    # reserve descriptor area size: 3*20 = 60
+    desc_area = add(b"\x00" * (desc_size * 3))
+    ilt1_off = add(struct.pack("<II", 0, 0))
+    iat1_off = add(struct.pack("<II", 0, 0))
+    ilt2_off = add(struct.pack("<II", 0, 0))
+    iat2_off = add(struct.pack("<II", 0, 0))
+    k_off = add(dll_k)
+    u_off = add(dll_u)
+    hn1_off = add(hn_exit)
+    hn2_off = add(hn_msg)
+
+    # patch ILT/IAT
+    struct.pack_into("<II", raw, ilt1_off - RAW, rva(hn1_off), 0)
+    struct.pack_into("<II", raw, iat1_off - RAW, rva(hn1_off), 0)
+    struct.pack_into("<II", raw, ilt2_off - RAW, rva(hn2_off), 0)
+    struct.pack_into("<II", raw, iat2_off - RAW, rva(hn2_off), 0)
+
+    # patch descriptors: OLT, TimeDateStamp, Forwarder, Name, IAT
+    struct.pack_into("<IIIII", raw, desc_area - RAW,
+                     rva(ilt1_off), 0, 0, rva(k_off), rva(iat1_off))
+    struct.pack_into("<IIIII", raw, desc_area - RAW + desc_size,
+                     rva(ilt2_off), 0, 0, rva(u_off), rva(iat2_off))
+
+    section_size = align(len(raw), FILE_ALIGN)
+    raw += b"\x00" * (section_size - len(raw))
+
+    image_base = 0x00400000
+    entry_rva = rva(code_off)
+    size_of_code = section_size
+    size_of_image = align(VA + section_size, SECT_ALIGN)
+
+    # ---- DOS header (64 bytes) ----
+    pe = bytearray()
+    pe += b"MZ" + b"\x90" * 62
+    struct.pack_into("<I", pe, 0x3C, 0x80)          # e_lfanew -> PE header
+
+    # ---- PE signature + COFF file header (20 bytes) ----
+    pe += b"PE\x00\x00"
+    # machine(0x14c) nsec(1) timestamp ptr_sym nsym optsz chars
+    pe += struct.pack("<HHIIIHH", 0x14C, 1, 0x5F123456, 0, 0, 0xE0, 0x0102)
+
+    # ---- Optional header PE32 (0xE0) ----
+    opt = bytearray()
+    opt += struct.pack("<HBB", 0x10B, 14, 0)        # magic, linker
+opt += struct.pack("<IIIIIII",                 # code, init, uninit, entry,
+                       size_of_code, 0, 0, entry_rva, rva(code_off), 0,
+                       image_base)                 # base_of_code, base_of_data, image_base
+    opt += struct.pack("<IIHHHHHHII",               # section_align, file_align,
+                       0x1000, FILE_ALIGN, 6, 0, 0, 0, 6, 0, 0, 0)
+    opt += struct.pack("<IIIIHHII",                 # size_of_image, size_of_headers,
+                       size_of_image, 0x200, 0, 2, 0x0100, 0,
+                       0x00100000, 0x1000)          # stack, heap
+    opt += struct.pack("<IIII", 0x00100000, 0x1000, 0, 16)  # heap, loader, numdirs
+    dirs = [0] * 16
+    dirs[1] = rva(desc_area)                       # import table
+    for d in dirs:
+        opt += struct.pack("<II", d, 28 if d else 0)
+    assert len(opt) == 0xE0, len(opt)
+    pe += opt
+
+    # ---- Section header (.text) ----
+    pe += b".text\x00\x00\x00"
+    pe += struct.pack("<IIII", section_size + 0x100, VA, section_size, RAW)
+    pe += struct.pack("<IIHH", 0, 0, 0, 0)
+    pe += struct.pack("<I", 0x60000020)            # CODE | EXECUTE | READ
+    assert len(pe) <= RAW, len(pe)
+    pe += b"\x00" * (RAW - len(pe))
+    pe += raw
+    return bytes(pe)
+
+
+def build_sample_pe_file(path: str) -> str:
+    with open(path, "wb") as f:
+        f.write(build_sample_pe())
+    return path
+
+
+def cmd_demo(args):
+    print("=" * 66)
+    print("  M7 - PE File Analyzer - offline demo")
+    print("=" * 66)
+    tmp = tempfile.mkdtemp(prefix="m7_demo_")
+    pe_path = os.path.join(tmp, "sample.exe")
+    build_sample_pe_file(pe_path)
+    pa = PEAnalyzer(pe_path)
+    pa.parse()
+    print("  Architecture    :", pa.arch)
+    print("  Machine         :", pa.file_header["machine_name"])
+    print("  Entry point     : %s" % pa.optional["address_of_entry_point"])
+    print("  Image base      : 0x%x" % pa.optional["image_base"])
+    print("  Sections        : %d" % len(pa.sections))
+    for s in pa.sections:
+        print("    %-8s entropy=%.4f %s"
+              % (s["name"], s["entropy"], ",".join(s["flags"] or ["?"])))
+    print("  Imports         : %d DLL(s)" % len(pa.imports))
+    for imp in pa.imports:
+        print("    %s -> %s" % (imp["dll"], ", ".join(imp["functions"])))
+    os.makedirs(args.output_dir, exist_ok=True)
+    report_path = os.path.join(args.output_dir, "report.json")
+    with open(report_path, "w") as f:
+        json.dump(pa.to_dict(), f, indent=2, default=str)
+    shutil.rmtree(tmp, ignore_errors=True)
+    print("  report          : %s" % report_path)
+    print("  exit=0")
+    return 0
+
+
+def cmd_analyze(args):
+    if not os.path.isfile(args.file):
+        print("Error: %s not found" % args.file)
         return 1
     try:
-        pa = PEAnalyzer(path)
+        pa = PEAnalyzer(args.file)
         pa.parse()
         print(pa.report())
+        if args.json:
+            os.makedirs(args.json, exist_ok=True)
+            with open(os.path.join(args.json, "report.json"), "w") as f:
+                json.dump(pa.to_dict(), f, indent=2, default=str)
         return 0
     except Exception as e:
         print("Error: %s" % e)
         return 1
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="pe_analyzer.py",
+        description="M7 - PE file analyzer (headers, sections, entropy, imports)")
+    sub = p.add_subparsers(dest="cmd")
+
+    sub.add_parser("demo", help="offline demo on a hand-built PE32 (exits 0)") \
+        .set_defaults(func=cmd_demo)
+
+    p_an = sub.add_parser("analyze", help="analyze a PE file")
+    p_an.add_argument("file")
+    p_an.add_argument("--json", metavar="DIR",
+                      help="also write report.json under DIR")
+    p_an.set_defaults(func=cmd_analyze)
+
+    p.add_argument("-o", "--output-dir", default="reports",
+                   help="directory for demo reports (default: reports)")
+
+    args = p.parse_args()
+    if not getattr(args, "cmd", None):
+        p.print_help()
+        return 0
+    return args.func(args)
 
 
 if __name__ == "__main__":
